@@ -13,6 +13,7 @@ import re
 import smtplib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -208,7 +209,14 @@ def collect_news():
 
 
 # ───────── AI 선별·요약 (Gemini 무료 키, 없으면 헤드라인만) ─────────
-def call_gemini(prompt, key):
+def gen_cfg(model, max_tokens):
+    cfg = {"responseMimeType": "application/json", "temperature": 0.4, "maxOutputTokens": max_tokens}
+    if "2.5" in model:
+        cfg["thinkingConfig"] = {"thinkingBudget": 0}  # 답변 분량이 생각에 잘리지 않도록
+    return cfg
+
+
+def call_gemini(prompt, key, max_tokens=8192):
     """무료 키는 가끔 429/503이 나므로 재시도하고, 안 되면 다른 모델로 넘어갑니다."""
     models = [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.0-flash"]
     for model in dict.fromkeys(models):
@@ -218,7 +226,7 @@ def call_gemini(prompt, key):
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                     params={"key": key},
                     json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"responseMimeType": "application/json", "temperature": 0.5}},
+                          "generationConfig": gen_cfg(model, max_tokens)},
                     timeout=120,
                 )
                 if r.status_code in (429, 500, 503):
@@ -269,60 +277,146 @@ def ensure_korean(brief):
     return brief
 
 
+BODY_CHARS = 3000
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0 Safari/537.36")
+
+
+def pick_items(news, key):
+    """1단계: 제목만 보고 주제별 핵심 기사를 고릅니다."""
+    lines = []
+    for topic, items in news.items():
+        lines.append(f"## {topic}")
+        for it in items:
+            lines.append(f"- id={it['id']} | {it['title']} ({it['source']})")
+    prompt = f"""아래는 주제별 뉴스 제목 목록입니다. 독자는 캐나다 BC주 코퀴틀람(광역밴쿠버) 거주자입니다.
+각 주제에서 가장 중요하고 독자 생활과 관련 깊은 기사 {ITEMS_PER_TOPIC}개의 id를 고르세요.
+- 같은 사건을 다룬 중복 기사는 하나만 고르세요.
+- 지역 소식은 코퀴틀람·포트코퀴틀람·포트무디·버나비 등 인근 소식을 우선하세요.
+- 오직 JSON만 출력: {{"picks": {{"주제명": ["n0", "n3"]}}}}
+
+{chr(10).join(lines)}
+"""
+    try:
+        text = call_gemini(prompt, key, max_tokens=2048)
+        picks = json.loads(text)["picks"]
+        selected = {}
+        for topic, items in news.items():
+            ids = set(picks.get(topic, []))
+            chosen = [it for it in items if it["id"] in ids][:ITEMS_PER_TOPIC] or items[:ITEMS_PER_TOPIC]
+            if chosen:
+                selected[topic] = chosen
+        print("1단계(기사 선별) 완료")
+        return selected
+    except Exception as e:
+        print("1단계 실패 → 앞쪽 기사로 대체:", e)
+        return {t: items[:ITEMS_PER_TOPIC] for t, items in news.items() if items}
+
+
+def resolve_url(url):
+    if "news.google.com" not in url:
+        return url
+    try:
+        from googlenewsdecoder import gnewsdecoder
+        res = gnewsdecoder(url, interval=1)
+        if res.get("status"):
+            return res["decoded_url"]
+    except Exception as e:
+        print("구글뉴스 주소 해석 실패:", str(e)[:100])
+    return None
+
+
+def fetch_body(item):
+    try:
+        url = resolve_url(item["link"])
+        if not url:
+            return ""
+        r = requests.get(url, timeout=15, headers={"User-Agent": UA, "Accept-Language": "en-CA,en;q=0.9,ko;q=0.8"})
+        if r.status_code != 200:
+            print(f"본문 접근 불가({r.status_code}):", url[:70])
+            return ""
+        import trafilatura
+        text = trafilatura.extract(r.text, include_comments=False, include_tables=False) or ""
+        return text[:BODY_CHARS] if len(text) >= 200 else ""
+    except Exception as e:
+        print("본문 가져오기 실패:", str(e)[:100])
+        return ""
+
+
+def attach_bodies(selected):
+    flat = [it for items in selected.values() for it in items]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        bodies = list(ex.map(fetch_body, flat))
+    for it, body in zip(flat, bodies):
+        it["body"] = body
+    print(f"본문 확보: {sum(1 for b in bodies if b)}/{len(flat)}건")
+
+
+def write_briefing(selected, n, key):
+    """2단계: 기사 본문을 읽고 5~6문장 한국어 요약을 작성합니다."""
+    parts = []
+    for topic, items in selected.items():
+        parts.append(f"## {topic}")
+        for it in items:
+            body = it.get("body") or "(본문 없음)"
+            parts.append(f"[id={it['id']}] 제목: {it['title']} ({it['source']})\n본문: {body}\n")
+    prompt = f"""당신은 기분 좋은 하루를 열어 주는 아침 뉴스 브리핑 작가입니다.
+독자는 캐나다 BC주 코퀴틀람(광역밴쿠버)에 사는 한국어 사용자이고, 오늘은 {date_label(n)}입니다.
+아래 기사들을 음성으로 들어도 이해되도록 한국어 구어체로 정리하세요.
+
+규칙:
+- 모든 출력은 반드시 한국어로만 쓰세요. 영어 문장을 그대로 두지 마세요.
+- 기사마다 headline(25자 안팎)과 summary를 쓰세요. summary는 5~6문장(약 300~450자)입니다.
+- summary 구성: ① 무슨 일이 있었는지 ② 배경과 이유 ③ 핵심 수치·금액·날짜·장소 ④ 누구에게 어떤 영향이 있는지 또는 앞으로의 일정.
+- 본문에 있는 사실만 쓰고, 숫자·금액·날짜·인명·지명은 정확히 옮기세요. 본문에 없는 내용은 추측하지 마세요.
+- 본문이 "(본문 없음)"인 기사는 제목에서 확인되는 사실만 2문장으로 쓰고 "자세한 내용은 링크에서 확인하세요."로 끝내세요.
+- 정부 정책·부동산 기사는 주민 생활, 집값, 금리에 주는 의미를 본문 근거 범위에서 설명하세요.
+- 지명·기관명은 한국에서 통용되는 표기를 쓰세요(예: 코퀴틀람, 브리티시컬럼비아주).
+- 차분하고 정확한 어조를 유지하고 과장 표현은 쓰지 마세요.
+- greeting은 따뜻하고 밝은 아침 인사 2문장, cheer는 오늘을 응원하는 한마디 1~2문장입니다.
+- 주제와 기사 순서를 그대로 유지하세요.
+- 오직 JSON만 출력하세요. 형식:
+{{"greeting": "...", "sections": [{{"topic": "주제명", "items": [{{"id": "n0", "headline": "...", "summary": "..."}}]}}], "cheer": "..."}}
+
+기사 목록:
+{chr(10).join(parts)}
+"""
+    text = call_gemini(prompt, key, max_tokens=8192)
+    if not text:
+        return None
+    data = json.loads(text)
+    by_id = {it["id"]: it for items in selected.values() for it in items}
+    sections = []
+    for sec in data.get("sections", []):
+        items = []
+        for it in sec.get("items", []):
+            src = by_id.get(it.get("id"))
+            if src:
+                items.append({"headline": it.get("headline") or src["title"], "summary": it.get("summary", ""),
+                              "link": src["link"], "source": src["source"]})
+        if items:
+            sections.append({"topic": sec.get("topic", ""), "items": items})
+    if not sections:
+        return None
+    return {"greeting": data.get("greeting", ""), "sections": sections, "cheer": data.get("cheer", "")}
+
+
 def curate_with_gemini(news, weather, n):
     key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not key:
         print("★ GEMINI_API_KEY가 비어 있습니다. Secrets 이름/값을 확인하세요 → 번역 보정 모드로 진행")
         return None
     print(f"GEMINI_API_KEY 확인됨 (길이 {len(key)})")
-    lines = []
-    for topic, items in news.items():
-        lines.append(f"## {topic}")
-        for it in items:
-            lines.append(f"- id={it['id']} | {it['title']} ({it['source']}) {it['snippet']}")
-    prompt = f"""당신은 기분 좋은 하루를 열어 주는 아침 뉴스 브리핑 작가입니다.
-독자는 캐나다 BC주 코퀴틀람(광역밴쿠버)에 사는 한국어 사용자입니다.
-오늘은 {date_label(n)}입니다. 아래 뉴스 목록에서 주제별로 가장 중요한 {ITEMS_PER_TOPIC}개를 고르고(중복·유사 기사는 하나만), 음성으로 읽기 좋은 구어체 한국어로 정리하세요.
-
-규칙:
-- 목록의 제목과 설명에 있는 사실만 사용하고, 없는 내용은 절대 지어내지 마세요.
-- 모든 출력(headline, summary, greeting, cheer)은 반드시 한국어로만 쓰세요. 영어 문장을 그대로 두지 마세요.
-- 영어 기사는 자연스러운 한국어로 번역·요약하고, 지명·기관명은 한국에서 통용되는 표기를 쓰세요(예: 코퀴틀람, 브리티시컬럼비아주).
-- 정부 정책·부동산 소식은 주민 생활이나 집값·금리에 어떤 의미인지 기사에 나온 범위 안에서 한 문장으로 덧붙이세요.
-- 지역 소식(개발·행사·사건사고)은 코퀴틀람, 포트코퀴틀람, 포트무디, 버나비 등 인근 소식을 우선하세요.
-- 주제는 목록의 순서를 그대로 유지하세요.
-- headline은 20자 안팎으로 간결하게, summary는 1~2문장으로 쉽게 쓰세요.
-- 무거운 소식도 차분하고 담담하게 전하세요. 과장·선정적 표현은 금지입니다.
-- greeting은 따뜻하고 밝은 아침 인사 2문장, cheer는 오늘을 응원하는 짧은 한마디 1~2문장입니다.
-- 뉴스가 없는 주제는 items를 빈 배열로 두세요.
-- 오직 JSON만 출력하세요. 형식:
-{{"greeting": "...", "sections": [{{"topic": "주제명", "items": [{{"id": "n0", "headline": "...", "summary": "..."}}]}}], "cheer": "..."}}
-
-뉴스 목록:
-{chr(10).join(lines)}
-"""
+    selected = pick_items(news, key)
+    attach_bodies(selected)
     try:
-        text = call_gemini(prompt, key)
-        if not text:
-            return None
-        data = json.loads(text)
-        by_id = {it["id"]: it for items in news.values() for it in items}
-        sections = []
-        for s in data.get("sections", []):
-            items = []
-            for it in s.get("items", []):
-                src = by_id.get(it.get("id"))
-                if src:
-                    items.append({"headline": it.get("headline") or src["title"], "summary": it.get("summary", ""),
-                                  "link": src["link"], "source": src["source"]})
-            if items:
-                sections.append({"topic": s.get("topic", ""), "items": items})
-        if not sections:
-            return None
-        return {"greeting": data.get("greeting", ""), "sections": sections, "cheer": data.get("cheer", "")}
+        brief = write_briefing(selected, n, key)
+        if brief:
+            print("2단계(본문 요약) 완료")
+            return brief
     except Exception as e:
-        print("Gemini 실패 → 헤드라인 모드로 대체:", e)
-        return None
+        print("2단계 실패:", e)
+    return fallback_brief(selected, n)
 
 
 def fallback_brief(news, n):
