@@ -5,17 +5,20 @@
   python briefing.py send    # 만들어 둔 이메일 발송
 """
 import asyncio
+import calendar
 import html
 import json
 import os
 import re
 import smtplib
 import sys
+import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from string import Template
+from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -36,15 +39,45 @@ SITE = Path("site")
 BUILD = Path("build")
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 
-# 주제별 검색어(구글뉴스 RSS) + 추가 RSS(연합뉴스)
-GN = "https://news.google.com/rss/search?hl=ko&gl=KR&ceid=KR:ko&q="
+# 주제별 검색어(구글뉴스 RSS). 영어 기사는 Gemini가 한국어로 번역·요약합니다.
+def gn_ca(q):
+    return "https://news.google.com/rss/search?hl=en-CA&gl=CA&ceid=CA:en&q=" + quote_plus(q)
+
+
+def gn_ko(q):
+    return "https://news.google.com/rss/search?hl=ko&gl=KR&ceid=KR:ko&q=" + quote_plus(q)
+
+
+LOCAL = '(Coquitlam OR "Port Coquitlam" OR "Port Moody" OR "Tri-Cities")'
 TOPICS = {
-    "정치·경제": [GN + "정치+OR+경제+when:1d", "https://www.yna.co.kr/rss/politics.xml", "https://www.yna.co.kr/rss/economy.xml"],
-    "IT·과학": [GN + "인공지능+OR+IT+OR+과학기술+when:1d"],
-    "국제": [GN + "국제+OR+해외+when:1d", "https://www.yna.co.kr/rss/international.xml"],
-    "부동산 정책": [GN + "부동산+정책+when:1d"],
-    "주요 사건·행사": [GN + "주요+사건+OR+행사+OR+사고+when:1d", "https://www.yna.co.kr/rss/society.xml"],
+    "BC·연방 정부 정책": [
+        gn_ca('("B.C. government" OR "provincial government" OR "British Columbia legislature") (policy OR announces OR legislation OR funding) when:1d'),
+        gn_ca('("federal government" OR "Government of Canada" OR Ottawa) (policy OR announces OR legislation OR budget) when:1d'),
+        "https://www.cbc.ca/webfeed/rss/rss-politics",
+    ],
+    "광역밴쿠버 부동산": [
+        gn_ca('("Metro Vancouver" OR Vancouver OR "B.C.") ("real estate" OR "housing market" OR housing OR rent OR mortgage) when:1d'),
+        gn_ca('("B.C." OR Canada) ("housing policy" OR "Bank of Canada" OR "interest rate" OR "home sales") when:1d'),
+    ],
+    "코퀴틀람 개발·행사": [
+        gn_ca(LOCAL + ' (development OR rezoning OR "city council" OR transit OR construction OR plan) when:3d'),
+        gn_ca(LOCAL + ' (event OR festival OR community OR "this weekend") when:3d'),
+    ],
+    "코퀴틀람·광역밴쿠버 사건·사고": [
+        gn_ca('(Coquitlam OR "Port Coquitlam" OR "Port Moody" OR Burnaby OR "Tri-Cities") (police OR RCMP OR fire OR crash OR collision OR closure OR emergency) when:1d'),
+        gn_ca('("Metro Vancouver" OR Vancouver OR Surrey OR Burnaby) (fatal OR evacuation OR "road closure" OR wildfire OR "storm warning" OR major) when:1d'),
+        "https://www.cbc.ca/webfeed/rss/rss-canada-britishcolumbia",
+    ],
+    "한국 AI·반도체 동향": [
+        gn_ko("AI 반도체 시장 동향 when:1d"),
+        gn_ko("삼성전자 OR SK하이닉스 OR 엔비디아 OR HBM when:1d"),
+        gn_ko("파운드리 OR 반도체 수출 OR 인공지능 투자 when:1d"),
+    ],
 }
+DEFAULT_MAX_AGE_HOURS = 30            # 기본: 최근 30시간 이내 기사만
+TOPIC_MAX_AGE = {"코퀴틀람 개발·행사": 72}  # 지역 소식은 드물어서 3일까지 허용
+PER_FEED = 6                          # 검색어(피드)당 최대 기사 수
+MAX_PER_TOPIC = 14
 
 WMO = {
     0: ("맑음", "☀️"), 1: ("대체로 맑음", "🌤️"), 2: ("구름 조금", "⛅"), 3: ("흐림", "☁️"),
@@ -142,30 +175,35 @@ def fetch_feed(url):
 
 def collect_news():
     news, counter = {}, 0
+    now_ts = time.time()
     for topic, urls in TOPICS.items():
+        max_age = TOPIC_MAX_AGE.get(topic, DEFAULT_MAX_AGE_HOURS) * 3600
         seen, items = set(), []
         for url in urls:
-            for e in fetch_feed(url)[:15]:
+            taken = 0
+            for e in fetch_feed(url):
+                if taken >= PER_FEED:
+                    break
+                pp = e.get("published_parsed")
+                if pp and now_ts - calendar.timegm(pp) > max_age:
+                    continue
                 title = clean(e.get("title", ""))
                 source = ""
                 if " - " in title:
                     title, source = title.rsplit(" - ", 1)
-                key = re.sub(r"\W", "", title)[:18]
+                key = re.sub(r"\W", "", title)[:18].lower()
                 if not title or key in seen:
                     continue
                 seen.add(key)
                 snippet = clean(e.get("summary", ""))
                 if snippet.startswith(title[:10]):
                     snippet = ""
-                items.append({"id": f"n{counter}", "title": title, "source": source or "연합뉴스",
+                items.append({"id": f"n{counter}", "title": title, "source": source,
                               "link": e.get("link", ""), "snippet": snippet[:200]})
                 counter += 1
-                if len(items) >= 10:
-                    break
-            if len(items) >= 10:
-                break
-        news[topic] = items
-        print(f"[{topic}] {len(items)}건 수집")
+                taken += 1
+        news[topic] = items[:MAX_PER_TOPIC]
+        print(f"[{topic}] {len(news[topic])}건 수집")
     return news
 
 
@@ -180,10 +218,15 @@ def curate_with_gemini(news, weather, n):
         for it in items:
             lines.append(f"- id={it['id']} | {it['title']} ({it['source']}) {it['snippet']}")
     prompt = f"""당신은 기분 좋은 하루를 열어 주는 아침 뉴스 브리핑 작가입니다.
+독자는 캐나다 BC주 코퀴틀람(광역밴쿠버)에 사는 한국어 사용자입니다.
 오늘은 {date_label(n)}입니다. 아래 뉴스 목록에서 주제별로 가장 중요한 {ITEMS_PER_TOPIC}개를 고르고(중복·유사 기사는 하나만), 음성으로 읽기 좋은 구어체 한국어로 정리하세요.
 
 규칙:
 - 목록의 제목과 설명에 있는 사실만 사용하고, 없는 내용은 절대 지어내지 마세요.
+- 영어 기사는 자연스러운 한국어로 번역·요약하고, 지명·기관명은 한국에서 통용되는 표기를 쓰세요(예: 코퀴틀람, 브리티시컬럼비아주).
+- 정부 정책·부동산 소식은 주민 생활이나 집값·금리에 어떤 의미인지 기사에 나온 범위 안에서 한 문장으로 덧붙이세요.
+- 지역 소식(개발·행사·사건사고)은 코퀴틀람, 포트코퀴틀람, 포트무디, 버나비 등 인근 소식을 우선하세요.
+- 주제는 목록의 순서를 그대로 유지하세요.
 - headline은 20자 안팎으로 간결하게, summary는 1~2문장으로 쉽게 쓰세요.
 - 무거운 소식도 차분하고 담담하게 전하세요. 과장·선정적 표현은 금지입니다.
 - greeting은 따뜻하고 밝은 아침 인사 2문장, cheer는 오늘을 응원하는 짧은 한마디 1~2문장입니다.
@@ -309,8 +352,8 @@ def sections_html(brief):
         for it in s["items"]:
             link = html.escape(it["link"], quote=True)
             summ = f'<p>{html.escape(it["summary"])}</p>' if it["summary"] else ""
-            items.append(f'<div class="item"><a href="{link}" target="_blank" rel="noopener">{html.escape(it["headline"])}</a>'
-                         f' <span class="src">· {html.escape(it["source"])}</span>{summ}</div>')
+            src = f' <span class="src">· {html.escape(it["source"])}</span>' if it["source"] else ""
+            items.append(f'<div class="item"><a href="{link}" target="_blank" rel="noopener">{html.escape(it["headline"])}</a>{src}{summ}</div>')
         out.append(f'<div class="card"><h2>{html.escape(s["topic"])}</h2>{"".join(items)}</div>')
     return "\n".join(out)
 
