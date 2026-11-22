@@ -208,6 +208,58 @@ def collect_news():
 
 
 # ───────── AI 선별·요약 (Gemini 무료 키, 없으면 헤드라인만) ─────────
+def call_gemini(prompt, key):
+    """무료 키는 가끔 429/503이 나므로 재시도하고, 안 되면 다른 모델로 넘어갑니다."""
+    models = [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    for model in dict.fromkeys(models):
+        for attempt in range(3):
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    params={"key": key},
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": {"responseMimeType": "application/json", "temperature": 0.5}},
+                    timeout=120,
+                )
+                if r.status_code in (429, 500, 503):
+                    print(f"Gemini {model} 일시 오류 {r.status_code} (시도 {attempt + 1}/3): {r.text[:200]}")
+                    time.sleep(8 * (attempt + 1))
+                    continue
+                if r.status_code != 200:
+                    print(f"Gemini {model} 오류 {r.status_code}: {r.text[:300]}")
+                    break  # 이 모델은 포기하고 다음 모델
+                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                print(f"Gemini 성공: {model}")
+                return text
+            except Exception as e:
+                print(f"Gemini {model} 예외: {e}")
+                time.sleep(3)
+    return None
+
+
+def has_korean(t):
+    return bool(re.search(r"[가-힣]", t or ""))
+
+
+def ensure_korean(brief):
+    """한글이 없는 제목·요약은 무료 번역(구글 번역)으로 한국어로 바꿉니다."""
+    try:
+        from deep_translator import GoogleTranslator
+        tr = GoogleTranslator(source="auto", target="ko")
+    except Exception as e:
+        print("번역기 준비 실패:", e)
+        return brief
+    for s in brief["sections"]:
+        for it in s["items"]:
+            for k in ("headline", "summary"):
+                if it.get(k) and not has_korean(it[k]):
+                    try:
+                        it[k] = tr.translate(it[k]) or it[k]
+                    except Exception as e:
+                        print("번역 실패:", e)
+    return brief
+
+
 def curate_with_gemini(news, weather, n):
     key = os.getenv("GEMINI_API_KEY")
     if not key:
@@ -223,6 +275,7 @@ def curate_with_gemini(news, weather, n):
 
 규칙:
 - 목록의 제목과 설명에 있는 사실만 사용하고, 없는 내용은 절대 지어내지 마세요.
+- 모든 출력(headline, summary, greeting, cheer)은 반드시 한국어로만 쓰세요. 영어 문장을 그대로 두지 마세요.
 - 영어 기사는 자연스러운 한국어로 번역·요약하고, 지명·기관명은 한국에서 통용되는 표기를 쓰세요(예: 코퀴틀람, 브리티시컬럼비아주).
 - 정부 정책·부동산 소식은 주민 생활이나 집값·금리에 어떤 의미인지 기사에 나온 범위 안에서 한 문장으로 덧붙이세요.
 - 지역 소식(개발·행사·사건사고)은 코퀴틀람, 포트코퀴틀람, 포트무디, 버나비 등 인근 소식을 우선하세요.
@@ -238,15 +291,9 @@ def curate_with_gemini(news, weather, n):
 {chr(10).join(lines)}
 """
     try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            params={"key": key},
-            json={"contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"responseMimeType": "application/json", "temperature": 0.5}},
-            timeout=120,
-        )
-        r.raise_for_status()
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = call_gemini(prompt, key)
+        if not text:
+            return None
         data = json.loads(text)
         by_id = {it["id"]: it for items in news.values() for it in items}
         sections = []
@@ -388,6 +435,7 @@ def build():
     weather = get_weather()
     news = collect_news()
     brief = curate_with_gemini(news, weather, n) or fallback_brief(news, n)
+    brief = ensure_korean(brief)
     script = build_script(brief, weather, n)
 
     SITE.mkdir(exist_ok=True)
