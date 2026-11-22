@@ -51,8 +51,8 @@ def gn_ko(q):
 LOCAL = '(Coquitlam OR "Port Coquitlam" OR "Port Moody" OR "Tri-Cities")'
 TOPICS = {
     "BC·연방 정부 정책": [
-        gn_ca('("B.C. government" OR "provincial government" OR "British Columbia legislature") (policy OR announces OR legislation OR funding) when:1d'),
-        gn_ca('("federal government" OR "Government of Canada" OR Ottawa) (policy OR announces OR legislation OR budget) when:1d'),
+        gn_ca('("B.C. government" OR "British Columbia government" OR "B.C. legislature" OR "B.C. premier" OR "B.C. minister") (policy OR announces OR legislation OR funding) when:1d'),
+        gn_ca('Canada ("federal government" OR "Government of Canada" OR Ottawa) (policy OR announces OR legislation OR budget) when:1d'),
         "https://www.cbc.ca/webfeed/rss/rss-politics",
     ],
     "광역밴쿠버 부동산": [
@@ -241,29 +241,40 @@ def has_korean(t):
     return bool(re.search(r"[가-힣]", t or ""))
 
 
+def translate_ko(text):
+    """구글 번역(무료 공개 주소)으로 한국어 번역. 별도 패키지 불필요."""
+    r = requests.get(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": text},
+        headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+    )
+    r.raise_for_status()
+    return "".join(seg[0] for seg in r.json()[0] if seg and seg[0]).strip()
+
+
 def ensure_korean(brief):
-    """한글이 없는 제목·요약은 무료 번역(구글 번역)으로 한국어로 바꿉니다."""
-    try:
-        from deep_translator import GoogleTranslator
-        tr = GoogleTranslator(source="auto", target="ko")
-    except Exception as e:
-        print("번역기 준비 실패:", e)
-        return brief
+    """한글이 없는 제목·요약은 한국어로 번역합니다(최종 안전장치)."""
+    done, failed = 0, 0
     for s in brief["sections"]:
         for it in s["items"]:
             for k in ("headline", "summary"):
                 if it.get(k) and not has_korean(it[k]):
                     try:
-                        it[k] = tr.translate(it[k]) or it[k]
+                        it[k] = translate_ko(it[k]) or it[k]
+                        done += 1
                     except Exception as e:
+                        failed += 1
                         print("번역 실패:", e)
+    print(f"번역 보정: 성공 {done}건, 실패 {failed}건")
     return brief
 
 
 def curate_with_gemini(news, weather, n):
-    key = os.getenv("GEMINI_API_KEY")
+    key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not key:
+        print("★ GEMINI_API_KEY가 비어 있습니다. Secrets 이름/값을 확인하세요 → 번역 보정 모드로 진행")
         return None
+    print(f"GEMINI_API_KEY 확인됨 (길이 {len(key)})")
     lines = []
     for topic, items in news.items():
         lines.append(f"## {topic}")
