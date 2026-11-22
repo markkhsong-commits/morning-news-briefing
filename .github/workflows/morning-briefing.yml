@@ -1,0 +1,72 @@
+name: Morning Briefing
+
+on:
+  schedule:
+    # 밴쿠버 오전 6시에 맞추기 위한 두 개의 시각(UTC). 서머타임이 바뀌어도 아래 '시간 확인' 단계가 알아서 걸러냅니다.
+    - cron: "0 13 * * *"
+    - cron: "0 14 * * *"
+  workflow_dispatch:   # 수동 실행(테스트용)
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    env:
+      TZ_NAME: America/Vancouver
+      CITY_NAME: 밴쿠버
+      LAT: "49.2827"
+      LON: "-123.1207"
+      PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+    steps:
+      - name: 시간 확인 (밴쿠버 오전 6시대에만 실행)
+        id: gate
+        run: |
+          HOUR=$(TZ=America/Vancouver date +%H)
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$HOUR" != "06" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "지금은 밴쿠버 ${HOUR}시라 건너뜁니다."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 패키지 설치
+        if: steps.gate.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: 브리핑 만들기
+        if: steps.gate.outputs.run == 'true'
+        run: python briefing.py build
+
+      - uses: actions/configure-pages@v5
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.gate.outputs.run == 'true'
+        with:
+          path: site
+
+      - name: 웹페이지 배포
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/deploy-pages@v4
+
+      - name: 이메일 보내기
+        if: steps.gate.outputs.run == 'true'
+        run: python briefing.py send
