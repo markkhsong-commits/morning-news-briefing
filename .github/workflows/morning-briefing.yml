@@ -2,21 +2,19 @@ name: Morning Briefing
 
 on:
   schedule:
-    # 밴쿠버 오전 6시에 맞추기 위한 두 개의 시각(UTC). 서머타임이 바뀌어도 아래 '시간 확인' 단계가 알아서 걸러냅니다.
+    # 밴쿠버 오전 6시에 맞추기 위한 두 개의 시각(UTC). 서머타임이 바뀌어도 '시간 확인' 단계가 걸러냅니다.
     - cron: "0 13 * * *"
     - cron: "0 14 * * *"
-  workflow_dispatch:   # 수동 실행(테스트용)
+  workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
-  briefing:
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
     env:
       TZ_NAME: America/Vancouver
       CITY_NAME: 밴쿠버
@@ -24,8 +22,6 @@ jobs:
       LON: "-123.1207"
       PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
-      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
     steps:
       - name: 시간 확인 (밴쿠버 오전 6시대에만 실행)
         id: gate
@@ -55,18 +51,57 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: python briefing.py build
 
-      - uses: actions/configure-pages@v5
+      - name: 웹페이지 파일 업로드
         if: steps.gate.outputs.run == 'true'
-
-      - uses: actions/upload-pages-artifact@v3
-        if: steps.gate.outputs.run == 'true'
+        uses: actions/upload-pages-artifact@v4
         with:
           path: site
 
-      - name: 웹페이지 배포
+      - name: 이메일 내용 보관
         if: steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-content
+          path: build
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 웹페이지 배포
+        id: deployment
         uses: actions/deploy-pages@v4
 
+  send:
+    needs: deploy
+    runs-on: ubuntu-latest
+    env:
+      PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 이메일 내용 내려받기
+        uses: actions/download-artifact@v4
+        with:
+          name: email-content
+          path: build
+
       - name: 이메일 보내기
-        if: steps.gate.outputs.run == 'true'
         run: python briefing.py send
