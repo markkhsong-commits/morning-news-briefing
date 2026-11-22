@@ -17,9 +17,9 @@ jobs:
       run: ${{ steps.gate.outputs.run }}
     env:
       TZ_NAME: America/Vancouver
-      CITY_NAME: 밴쿠버
-      LAT: "49.2827"
-      LON: "-123.1207"
+      CITY_NAME: 코퀴틀람
+      LAT: "49.2838"
+      LON: "-122.7932"
       PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
     steps:
