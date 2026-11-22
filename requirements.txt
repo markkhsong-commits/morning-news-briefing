@@ -2,4 +2,5 @@ requests
 feedparser
 edge-tts
 gTTS
-deep-translator
+trafilatura
+googlenewsdecoder
