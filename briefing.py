@@ -216,10 +216,56 @@ def gen_cfg(model, max_tokens):
     return cfg
 
 
+NOTES = []          # 실패 원인(메일에 표시)
+_MODELS = []        # 사용 가능한 모델 캐시
+_GOOD = []          # 성공한 모델 기억
+
+
+def list_models(key):
+    """내 키로 실제 사용할 수 있는 flash 계열 모델을 찾습니다(모델명이 바뀌어도 대응)."""
+    if _MODELS:
+        return _MODELS
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"key": key, "pageSize": 200}, timeout=30)
+        r.raise_for_status()
+        names = []
+        for m in r.json().get("models", []):
+            name = m["name"].split("/")[-1]
+            if "generateContent" not in m.get("supportedGenerationMethods", []) or "flash" not in name:
+                continue
+            if any(x in name for x in ("image", "tts", "audio", "live", "embedding", "robotics", "computer", "vision", "learnlm")):
+                continue
+            names.append(name)
+
+        def score(n):
+            v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+            return (0 if re.search(r"preview|exp|latest", n) else 1, float(v.group(1)) if v else 0,
+                    0 if "lite" in n else 1)
+
+        names.sort(key=score, reverse=True)
+        _MODELS.extend(names[:4])
+        print("사용 가능한 모델:", _MODELS)
+    except Exception as e:
+        msg = f"모델 목록 조회 실패: {str(e)[:150]}"
+        print(msg)
+        NOTES.append(msg)
+    if not _MODELS:
+        _MODELS.extend([GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.0-flash"])
+    return _MODELS
+
+
+def gemini_error(r):
+    try:
+        return r.json()["error"]["message"][:160]
+    except Exception:
+        return r.text[:160]
+
+
 def call_gemini(prompt, key, max_tokens=8192):
     """무료 키는 가끔 429/503이 나므로 재시도하고, 안 되면 다른 모델로 넘어갑니다."""
-    models = [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.0-flash"]
-    for model in dict.fromkeys(models):
+    models = list(dict.fromkeys(_GOOD + list_models(key)))
+    for model in models:
         for attempt in range(3):
             try:
                 r = requests.post(
@@ -227,20 +273,28 @@ def call_gemini(prompt, key, max_tokens=8192):
                     params={"key": key},
                     json={"contents": [{"parts": [{"text": prompt}]}],
                           "generationConfig": gen_cfg(model, max_tokens)},
-                    timeout=120,
+                    timeout=180,
                 )
                 if r.status_code in (429, 500, 503):
-                    print(f"Gemini {model} 일시 오류 {r.status_code} (시도 {attempt + 1}/3): {r.text[:200]}")
+                    msg = f"{model} → HTTP {r.status_code}: {gemini_error(r)}"
+                    print(f"일시 오류 (시도 {attempt + 1}/3): {msg}")
+                    NOTES.append(msg)
                     time.sleep(8 * (attempt + 1))
                     continue
                 if r.status_code != 200:
-                    print(f"Gemini {model} 오류 {r.status_code}: {r.text[:300]}")
+                    msg = f"{model} → HTTP {r.status_code}: {gemini_error(r)}"
+                    print("오류:", msg)
+                    NOTES.append(msg)
                     break  # 이 모델은 포기하고 다음 모델
                 text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 print(f"Gemini 성공: {model}")
+                if model not in _GOOD:
+                    _GOOD.append(model)
                 return text
             except Exception as e:
-                print(f"Gemini {model} 예외: {e}")
+                msg = f"{model} → 예외: {str(e)[:150]}"
+                print(msg)
+                NOTES.append(msg)
                 time.sleep(3)
     return None
 
@@ -404,7 +458,9 @@ def write_briefing(selected, n, key):
 def curate_with_gemini(news, weather, n):
     key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not key:
-        print("★ GEMINI_API_KEY가 비어 있습니다. Secrets 이름/값을 확인하세요 → 번역 보정 모드로 진행")
+        msg = "GEMINI_API_KEY가 비어 있습니다. GitHub Secrets의 이름(GEMINI_API_KEY)과 값을 확인하세요."
+        print("★", msg)
+        NOTES.append(msg)
         return None
     print(f"GEMINI_API_KEY 확인됨 (길이 {len(key)})")
     selected = pick_items(news, key)
@@ -427,7 +483,7 @@ def fallback_brief(news, n):
         if top:
             sections.append({"topic": topic, "items": top})
     return {"greeting": f"좋은 아침입니다! {date_label(n)} 아침 브리핑을 시작할게요.",
-            "sections": sections, "cheer": "오늘도 좋은 일이 가득한 하루 되세요!"}
+            "sections": sections, "cheer": "오늘도 좋은 일이 가득한 하루 되세요!", "fallback": True}
 
 
 # ───────── 음성 ─────────
@@ -483,9 +539,28 @@ h2{font-size:16px;margin:0 0 10px;color:var(--accent)}
 <div class="card"><div class="hello">$greeting</div>
 <audio controls preload="auto" src="briefing.mp3"></audio></div>
 $weather_html
+$notes_html
 $sections_html
 <div class="card cheer">💛 $cheer</div>
 </main></body></html>""")
+
+
+def notes_html(brief):
+    if not brief.get("fallback"):
+        return ""
+    notes = list(dict.fromkeys(NOTES))[-4:] or ["원인 미상(로그 확인 필요)"]
+    items = "".join(f"<li>{html.escape(x)}</li>" for x in notes)
+    return ('<div class="card" style="font-size:13px;color:var(--sub)"><b>⚠️ AI 요약을 만들지 못해 제목만 번역했어요.</b>'
+            f'<ul style="margin:6px 0 0 18px;padding:0">{items}</ul></div>')
+
+
+def notes_email(brief):
+    if not brief.get("fallback"):
+        return ""
+    notes = list(dict.fromkeys(NOTES))[-4:] or ["원인 미상(로그 확인 필요)"]
+    items = "".join(f"<li>{html.escape(x)}</li>" for x in notes)
+    return ('<div style="background:#fff4e5;border-radius:12px;padding:10px 14px;margin:12px 0;font-size:13px;color:#8a5a00">'
+            f'<b>⚠️ AI 요약을 만들지 못해 제목만 번역했어요.</b><ul style="margin:6px 0 0 18px;padding:0">{items}</ul></div>')
 
 
 def weather_html(w):
@@ -530,7 +605,7 @@ def email_html(brief, w, n):
               f'지금 {w["now"]}° · 최고 {w["tmax"]}° / 최저 {w["tmin"]}° · 비 {w["rain"]}%<br>'
               f'<span style="color:#667085">👕 {html.escape(w["tip"])}</span></div>')
     return (f'<div style="max-width:600px;margin:auto;font-family:-apple-system,\'Malgun Gothic\',sans-serif;color:#1d2733">'
-            f'<h2>☀️ {date_label(n)} 아침 브리핑</h2><p>{html.escape(brief["greeting"])}</p>{btn}{wx}{sec}'
+            f'<h2>☀️ {date_label(n)} 아침 브리핑</h2><p>{html.escape(brief["greeting"])}</p>{btn}{wx}{notes_email(brief)}{sec}'
             f'<p style="text-align:center;margin-top:24px">💛 {html.escape(brief["cheer"])}</p></div>')
 
 
@@ -547,7 +622,7 @@ def build():
     BUILD.mkdir(exist_ok=True)
     make_audio(script, SITE / "briefing.mp3")
     page = PAGE_TEMPLATE.substitute(
-        date=date_label(n), greeting=html.escape(brief["greeting"]), weather_html=weather_html(weather),
+        date=date_label(n), greeting=html.escape(brief["greeting"]), weather_html=weather_html(weather), notes_html=notes_html(brief),
         sections_html=sections_html(brief), cheer=html.escape(brief["cheer"]))
     (SITE / "index.html").write_text(page, encoding="utf-8")
 
