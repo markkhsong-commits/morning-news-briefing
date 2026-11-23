@@ -244,7 +244,7 @@ def list_models(key):
                     0 if "lite" in n else 1)
 
         names.sort(key=score, reverse=True)
-        _MODELS.extend(names[:4])
+        _MODELS.extend(names[:6])
         print("사용 가능한 모델:", _MODELS)
     except Exception as e:
         msg = f"모델 목록 조회 실패: {str(e)[:150]}"
@@ -262,40 +262,48 @@ def gemini_error(r):
         return r.text[:160]
 
 
-def call_gemini(prompt, key, max_tokens=8192):
-    """무료 키는 가끔 429/503이 나므로 재시도하고, 안 되면 다른 모델로 넘어갑니다."""
+def call_gemini(prompt, key, max_tokens=8192, timeout=120):
+    """한 모델이 바쁘면(503/시간초과) 즉시 다음 모델로 넘어가고, 전체를 최대 두 바퀴 돕니다."""
     models = list(dict.fromkeys(_GOOD + list_models(key)))
-    for model in models:
-        for attempt in range(3):
+    dead = set()  # 404/400처럼 다시 해도 소용없는 모델
+    for rnd in range(2):
+        for model in models:
+            if model in dead:
+                continue
             try:
                 r = requests.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                     params={"key": key},
                     json={"contents": [{"parts": [{"text": prompt}]}],
                           "generationConfig": gen_cfg(model, max_tokens)},
-                    timeout=180,
+                    timeout=timeout,
                 )
-                if r.status_code in (429, 500, 503):
+                if r.status_code in (429, 500, 502, 503, 504):
                     msg = f"{model} → HTTP {r.status_code}: {gemini_error(r)}"
-                    print(f"일시 오류 (시도 {attempt + 1}/3): {msg}")
+                    print(f"[{rnd + 1}바퀴] 바쁨 → 다음 모델: {msg}")
                     NOTES.append(msg)
-                    time.sleep(8 * (attempt + 1))
                     continue
                 if r.status_code != 200:
                     msg = f"{model} → HTTP {r.status_code}: {gemini_error(r)}"
                     print("오류:", msg)
                     NOTES.append(msg)
-                    break  # 이 모델은 포기하고 다음 모델
-                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    dead.add(model)
+                    continue
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if not text:
+                    raise ValueError("빈 응답")
                 print(f"Gemini 성공: {model}")
                 if model not in _GOOD:
-                    _GOOD.append(model)
+                    _GOOD.insert(0, model)
                 return text
             except Exception as e:
-                msg = f"{model} → 예외: {str(e)[:150]}"
-                print(msg)
+                msg = f"{model} → 예외: {str(e)[:120]}"
+                print(f"[{rnd + 1}바퀴] {msg}")
                 NOTES.append(msg)
-                time.sleep(3)
+        if rnd == 0:
+            print("모든 모델이 바쁨 → 20초 뒤 한 번 더 시도")
+            time.sleep(20)
     return None
 
 
@@ -548,7 +556,7 @@ $sections_html
 def notes_html(brief):
     if not brief.get("fallback"):
         return ""
-    notes = list(dict.fromkeys(NOTES))[-4:] or ["원인 미상(로그 확인 필요)"]
+    notes = list(dict.fromkeys(NOTES))[-6:] or ["원인 미상(로그 확인 필요)"]
     items = "".join(f"<li>{html.escape(x)}</li>" for x in notes)
     return ('<div class="card" style="font-size:13px;color:var(--sub)"><b>⚠️ AI 요약을 만들지 못해 제목만 번역했어요.</b>'
             f'<ul style="margin:6px 0 0 18px;padding:0">{items}</ul></div>')
@@ -557,7 +565,7 @@ def notes_html(brief):
 def notes_email(brief):
     if not brief.get("fallback"):
         return ""
-    notes = list(dict.fromkeys(NOTES))[-4:] or ["원인 미상(로그 확인 필요)"]
+    notes = list(dict.fromkeys(NOTES))[-6:] or ["원인 미상(로그 확인 필요)"]
     items = "".join(f"<li>{html.escape(x)}</li>" for x in notes)
     return ('<div style="background:#fff4e5;border-radius:12px;padding:10px 14px;margin:12px 0;font-size:13px;color:#8a5a00">'
             f'<b>⚠️ AI 요약을 만들지 못해 제목만 번역했어요.</b><ul style="margin:6px 0 0 18px;padding:0">{items}</ul></div>')
