@@ -2,9 +2,11 @@ name: Morning Briefing
 
 on:
   schedule:
-    # 밴쿠버 오전 6시에 맞추기 위한 두 개의 시각(UTC). 서머타임이 바뀌어도 '시간 확인' 단계가 걸러냅니다.
-    - cron: "0 13 * * *"
-    - cron: "0 14 * * *"
+    # 밴쿠버 오전 6시 17분 (겨울/표준시 PST = UTC-8 → UTC 14:17)
+    # ★ 서머타임(PDT, 3월 둘째 일요일~11월 첫째 일요일)에는 "17 13 * * *" 로 바꾸세요.
+    #   2027년 서머타임 시작: 3월 14일 / 종료: 11월 7일
+    # 정각(분=0)은 GitHub이 가장 붐벼서 일부러 17분으로 잡았습니다.
+    - cron: "17 14 * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,8 +15,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.gate.outputs.run }}
     env:
       TZ_NAME: America/Vancouver
       CITY_NAME: 코퀴틀람
@@ -23,42 +23,25 @@ jobs:
       PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
     steps:
-      - name: 시간 확인 (밴쿠버 오전 6시대에만 실행)
-        id: gate
-        run: |
-          HOUR=$(TZ=America/Vancouver date +%H)
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$HOUR" != "06" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "지금은 밴쿠버 ${HOUR}시라 건너뜁니다."
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
-        if: steps.gate.outputs.run == 'true'
         with:
           python-version: "3.12"
           cache: pip
 
       - name: 패키지 설치
-        if: steps.gate.outputs.run == 'true'
         run: pip install -r requirements.txt
 
       - name: 브리핑 만들기
-        if: steps.gate.outputs.run == 'true'
         run: python briefing.py build
 
       - name: 웹페이지 파일 업로드
-        if: steps.gate.outputs.run == 'true'
         uses: actions/upload-pages-artifact@v4
         with:
           path: site
 
       - name: 이메일 내용 보관
-        if: steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: email-content
@@ -66,7 +49,6 @@ jobs:
 
   deploy:
     needs: build
-    if: needs.build.outputs.run == 'true'
     runs-on: ubuntu-latest
     permissions:
       pages: write
