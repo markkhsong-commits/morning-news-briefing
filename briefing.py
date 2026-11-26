@@ -414,6 +414,13 @@ def attach_bodies(selected):
     print(f"본문 확보: {sum(1 for b in bodies if b)}/{len(flat)}건")
 
 
+def strip_link_phrases(text):
+    """'자세한 내용은 링크에서 확인하세요' 같은 안내 문구를 제거합니다."""
+    t = re.sub(r"[^.!?\n]*(링크|원문|기사)[^.!?\n]*(확인|참고|참조)[^.!?\n]*[.!?]?", "", text or "")
+    t = re.sub(r"자세한 내용은[^.!?\n]*[.!?]?", "", t)
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+
 def write_briefing(selected, n, key):
     """2단계: 기사 본문을 읽고 5~6문장 한국어 요약을 작성합니다."""
     parts = []
@@ -431,7 +438,7 @@ def write_briefing(selected, n, key):
 - 기사마다 headline(25자 안팎)과 summary를 쓰세요. summary는 5~6문장(약 300~450자)입니다.
 - summary 구성: ① 무슨 일이 있었는지 ② 배경과 이유 ③ 핵심 수치·금액·날짜·장소 ④ 누구에게 어떤 영향이 있는지 또는 앞으로의 일정.
 - 본문에 있는 사실만 쓰고, 숫자·금액·날짜·인명·지명은 정확히 옮기세요. 본문에 없는 내용은 추측하지 마세요.
-- 본문이 "(본문 없음)"인 기사는 제목에서 확인되는 사실만 2문장으로 쓰고 "자세한 내용은 링크에서 확인하세요."로 끝내세요.
+- 본문이 "(본문 없음)"인 기사는 제목에서 확인되는 사실만 2문장으로 쓰세요. "링크에서 확인하세요" 같은 안내 문구는 어떤 기사에도 쓰지 마세요.
 - 정부 정책·부동산 기사는 주민 생활, 집값, 금리에 주는 의미를 본문 근거 범위에서 설명하세요.
 - 지명·기관명은 한국에서 통용되는 표기를 쓰세요(예: 코퀴틀람, 브리티시컬럼비아주).
 - 차분하고 정확한 어조를 유지하고 과장 표현은 쓰지 마세요.
@@ -454,7 +461,7 @@ def write_briefing(selected, n, key):
         for it in sec.get("items", []):
             src = by_id.get(it.get("id"))
             if src:
-                items.append({"headline": it.get("headline") or src["title"], "summary": it.get("summary", ""),
+                items.append({"headline": it.get("headline") or src["title"], "summary": strip_link_phrases(it.get("summary", "")),
                               "link": src["link"], "source": src["source"]})
         if items:
             sections.append({"topic": sec.get("topic", ""), "items": items})
@@ -540,7 +547,7 @@ h1{font-size:22px;margin:8px 0 2px}.date{color:var(--sub);margin:0 0 16px}
 .weather b{font-size:20px}.tip{color:var(--sub);margin-top:6px;font-size:14px}
 h2{font-size:16px;margin:0 0 10px;color:var(--accent)}
 .item{padding:10px 0;border-top:1px solid var(--line)}.item:first-of-type{border-top:0}
-.item a{color:var(--text);font-weight:600;text-decoration:none}.item p{margin:4px 0 0;color:var(--sub);font-size:14px}
+.item a{color:var(--text);font-weight:600;text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px}.item p{margin:4px 0 0;color:var(--sub);font-size:14px}
 .src{font-size:12px;color:var(--sub)}.cheer{text-align:center;font-size:16px}
 </style></head><body><main>
 <h1>☀️ 아침 브리핑</h1><p class="date">$date</p>
@@ -604,7 +611,7 @@ def email_html(brief, w, n):
         sec += f'<h3 style="color:#ff7a45;margin:18px 0 6px">{html.escape(s["topic"])}</h3>'
         for it in s["items"]:
             sec += (f'<p style="margin:6px 0"><a href="{html.escape(it["link"], quote=True)}" style="color:#1d2733;'
-                    f'font-weight:600;text-decoration:none">{html.escape(it["headline"])}</a>'
+                    f'font-weight:600;text-decoration:underline;text-decoration-color:#ff7a45">{html.escape(it["headline"])}</a>'
                     f'<br><span style="color:#667085;font-size:14px">{html.escape(it["summary"])}</span></p>')
     wx = ""
     if w:
