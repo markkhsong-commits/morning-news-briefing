@@ -339,21 +339,24 @@ def ensure_korean(brief):
     return brief
 
 
-BODY_CHARS = 3000
+BODY_CHARS = 4500
+CANDIDATES_PER_TOPIC = 6   # 본문 확보 실패에 대비해 넉넉히 뽑는 후보 수
+MIN_SUMMARY_CHARS = 250    # 본문이 있는데 이보다 짧으면 다시 쓰게 함
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/124.0 Safari/537.36")
 
 
 def pick_items(news, key):
-    """1단계: 제목만 보고 주제별 핵심 기사를 고릅니다."""
+    """1단계: 제목만 보고 주제별 핵심 기사 후보를 중요도 순으로 고릅니다."""
     lines = []
     for topic, items in news.items():
         lines.append(f"## {topic}")
         for it in items:
             lines.append(f"- id={it['id']} | {it['title']} ({it['source']})")
     prompt = f"""아래는 주제별 뉴스 제목 목록입니다. 독자는 캐나다 BC주 코퀴틀람(광역밴쿠버) 거주자입니다.
-각 주제에서 가장 중요하고 독자 생활과 관련 깊은 기사 {ITEMS_PER_TOPIC}개의 id를 고르세요.
+각 주제에서 가장 중요하고 독자 생활과 관련 깊은 기사 {CANDIDATES_PER_TOPIC}개의 id를 중요도 순서로 고르세요.
 - 같은 사건을 다룬 중복 기사는 하나만 고르세요.
+- 내용이 충실한 보도 기사를 우선하고, 영상·라이브블로그·단신 모음·칼럼 제목은 뒤로 미루세요.
 - 지역 소식은 코퀴틀람·포트코퀴틀람·포트무디·버나비 등 인근 소식을 우선하세요.
 - 오직 JSON만 출력: {{"picks": {{"주제명": ["n0", "n3"]}}}}
 
@@ -362,17 +365,19 @@ def pick_items(news, key):
     try:
         text = call_gemini(prompt, key, max_tokens=2048)
         picks = json.loads(text)["picks"]
+        by_id = {it["id"]: it for items in news.values() for it in items}
         selected = {}
         for topic, items in news.items():
-            ids = set(picks.get(topic, []))
-            chosen = [it for it in items if it["id"] in ids][:ITEMS_PER_TOPIC] or items[:ITEMS_PER_TOPIC]
+            ids = picks.get(topic, [])
+            chosen = [by_id[i] for i in ids if i in by_id and by_id[i] in items]
+            chosen = (chosen + [it for it in items if it not in chosen])[:CANDIDATES_PER_TOPIC] if chosen else items[:CANDIDATES_PER_TOPIC]
             if chosen:
                 selected[topic] = chosen
-        print("1단계(기사 선별) 완료")
+        print("1단계(기사 후보 선별) 완료")
         return selected
     except Exception as e:
         print("1단계 실패 → 앞쪽 기사로 대체:", e)
-        return {t: items[:ITEMS_PER_TOPIC] for t, items in news.items() if items}
+        return {t: items[:CANDIDATES_PER_TOPIC] for t, items in news.items() if items}
 
 
 def resolve_url(url):
@@ -388,18 +393,42 @@ def resolve_url(url):
     return None
 
 
+def fetch_direct(url):
+    r = requests.get(url, timeout=15, headers={"User-Agent": UA, "Accept-Language": "en-CA,en;q=0.9,ko;q=0.8"})
+    if r.status_code != 200:
+        print(f"본문 접근 불가({r.status_code}):", url[:70])
+        return ""
+    import trafilatura
+    return trafilatura.extract(r.text, include_comments=False, include_tables=False) or ""
+
+
+def fetch_via_reader(url):
+    """직접 접근이 막힌 사이트용 우회(무료 리더 서비스)."""
+    r = requests.get("https://r.jina.ai/" + url, timeout=30, headers={"User-Agent": UA, "Accept": "text/plain"})
+    if r.status_code != 200:
+        return ""
+    text = r.text
+    if "Markdown Content:" in text:
+        text = text.split("Markdown Content:", 1)[1]
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def fetch_body(item):
     try:
         url = resolve_url(item["link"])
         if not url:
             return ""
-        r = requests.get(url, timeout=15, headers={"User-Agent": UA, "Accept-Language": "en-CA,en;q=0.9,ko;q=0.8"})
-        if r.status_code != 200:
-            print(f"본문 접근 불가({r.status_code}):", url[:70])
-            return ""
-        import trafilatura
-        text = trafilatura.extract(r.text, include_comments=False, include_tables=False) or ""
-        return text[:BODY_CHARS] if len(text) >= 200 else ""
+        text = ""
+        try:
+            text = fetch_direct(url)
+        except Exception as e:
+            print("직접 접근 실패:", str(e)[:80])
+        if len(text) < 300:
+            try:
+                text = fetch_via_reader(url) or text
+            except Exception as e:
+                print("우회 접근 실패:", str(e)[:80])
+        return text[:BODY_CHARS] if len(text) >= 300 else ""
     except Exception as e:
         print("본문 가져오기 실패:", str(e)[:100])
         return ""
@@ -407,11 +436,25 @@ def fetch_body(item):
 
 def attach_bodies(selected):
     flat = [it for items in selected.values() for it in items]
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         bodies = list(ex.map(fetch_body, flat))
     for it, body in zip(flat, bodies):
         it["body"] = body
-    print(f"본문 확보: {sum(1 for b in bodies if b)}/{len(flat)}건")
+    ok = sum(1 for x in bodies if x)
+    print(f"본문 확보: {ok}/{len(flat)}건")
+    return ok, len(flat)
+
+
+def finalize_selection(selected):
+    """본문이 있는 기사를 우선해서 주제별 최종 기사를 정합니다."""
+    final = {}
+    for topic, items in selected.items():
+        with_body = [it for it in items if it.get("body")]
+        without = [it for it in items if not it.get("body")]
+        chosen = (with_body + without)[:ITEMS_PER_TOPIC]
+        if chosen:
+            final[topic] = chosen
+    return final
 
 
 def strip_link_phrases(text):
@@ -435,9 +478,10 @@ def write_briefing(selected, n, key):
 
 규칙:
 - 모든 출력은 반드시 한국어로만 쓰세요. 영어 문장을 그대로 두지 마세요.
-- 기사마다 headline(25자 안팎)과 summary를 쓰세요. summary는 5~6문장(약 300~450자)입니다.
-- summary 구성: ① 무슨 일이 있었는지 ② 배경과 이유 ③ 핵심 수치·금액·날짜·장소 ④ 누구에게 어떤 영향이 있는지 또는 앞으로의 일정.
-- 본문에 있는 사실만 쓰고, 숫자·금액·날짜·인명·지명은 정확히 옮기세요. 본문에 없는 내용은 추측하지 마세요.
+- 기사마다 headline(25자 안팎)과 summary를 쓰세요.
+- 본문이 있는 기사의 summary는 **반드시 5~6문장, 공백 포함 350~500자**로 쓰세요. 이보다 짧으면 안 됩니다.
+- summary 구성: ① 무슨 일이 있었는지 ② 배경과 이유 ③ 핵심 수치·금액·날짜·장소·관련 인물 ④ 누구에게 어떤 영향이 있는지 ⑤ 앞으로의 일정이나 남은 쟁점.
+- 본문에 있는 구체적 사실(숫자, 이름, 일정, 인용된 입장, 찬반 의견)을 빠짐없이 활용해 풍부하게 쓰세요. 본문에 없는 내용은 추측하지 마세요.
 - 본문이 "(본문 없음)"인 기사는 제목에서 확인되는 사실만 2문장으로 쓰세요. "링크에서 확인하세요" 같은 안내 문구는 어떤 기사에도 쓰지 마세요.
 - 정부 정책·부동산 기사는 주민 생활, 집값, 금리에 주는 의미를 본문 근거 범위에서 설명하세요.
 - 지명·기관명은 한국에서 통용되는 표기를 쓰세요(예: 코퀴틀람, 브리티시컬럼비아주).
@@ -450,7 +494,7 @@ def write_briefing(selected, n, key):
 기사 목록:
 {chr(10).join(parts)}
 """
-    text = call_gemini(prompt, key, max_tokens=8192)
+    text = call_gemini(prompt, key, max_tokens=12000, timeout=180)
     if not text:
         return None
     data = json.loads(text)
@@ -461,13 +505,47 @@ def write_briefing(selected, n, key):
         for it in sec.get("items", []):
             src = by_id.get(it.get("id"))
             if src:
-                items.append({"headline": it.get("headline") or src["title"], "summary": strip_link_phrases(it.get("summary", "")),
+                items.append({"id": src["id"], "headline": it.get("headline") or src["title"],
+                              "summary": strip_link_phrases(it.get("summary", "")),
                               "link": src["link"], "source": src["source"]})
         if items:
             sections.append({"topic": sec.get("topic", ""), "items": items})
     if not sections:
         return None
     return {"greeting": data.get("greeting", ""), "sections": sections, "cheer": data.get("cheer", "")}
+
+
+def expand_short(brief, selected, key):
+    """본문이 있는데도 요약이 짧게 나온 기사만 골라 5~6문장으로 다시 쓰게 합니다."""
+    by_id = {it["id"]: it for items in selected.values() for it in items}
+    short = [it for s in brief["sections"] for it in s["items"]
+             if by_id.get(it.get("id"), {}).get("body") and len(it["summary"]) < MIN_SUMMARY_CHARS]
+    if not short:
+        return 0
+    print(f"짧은 요약 {len(short)}건 → 다시 쓰기")
+    parts = []
+    for it in short:
+        src = by_id[it["id"]]
+        parts.append(f"[id={it['id']}] 제목: {src['title']}\n현재 요약: {it['summary']}\n본문: {src['body']}\n")
+    prompt = f"""아래 기사들의 요약이 너무 짧습니다. 본문의 구체적 사실(수치, 이름, 일정, 배경, 각 입장)을 더 활용해
+기사마다 한국어 구어체로 **5~6문장, 공백 포함 350~500자** 요약으로 다시 쓰세요.
+본문에 없는 내용은 추측하지 말고, "링크에서 확인하세요" 같은 안내 문구는 쓰지 마세요.
+오직 JSON만 출력: {{"items": [{{"id": "n0", "summary": "..."}}]}}
+
+{chr(10).join(parts)}
+"""
+    try:
+        text = call_gemini(prompt, key, max_tokens=8192, timeout=150)
+        new = {x["id"]: strip_link_phrases(x.get("summary", "")) for x in json.loads(text).get("items", [])}
+        done = 0
+        for it in short:
+            if len(new.get(it["id"], "")) > len(it["summary"]):
+                it["summary"] = new[it["id"]]
+                done += 1
+        return done
+    except Exception as e:
+        print("다시 쓰기 실패:", e)
+        return 0
 
 
 def curate_with_gemini(news, weather, n):
@@ -479,14 +557,20 @@ def curate_with_gemini(news, weather, n):
         return None
     print(f"GEMINI_API_KEY 확인됨 (길이 {len(key)})")
     selected = pick_items(news, key)
-    attach_bodies(selected)
+    ok, total = attach_bodies(selected)
+    selected = finalize_selection(selected)
+    final_total = sum(len(v) for v in selected.values())
+    with_body = sum(1 for v in selected.values() for it in v if it.get("body"))
     try:
         brief = write_briefing(selected, n, key)
         if brief:
-            print("2단계(본문 요약) 완료")
+            expand_short(brief, selected, key)
+            brief["stats"] = f"기사 {final_total}건 중 본문 기반 요약 {with_body}건 (본문 확보 {ok}/{total}건)"
+            print("2단계(본문 요약) 완료 -", brief["stats"])
             return brief
     except Exception as e:
         print("2단계 실패:", e)
+        NOTES.append(f"요약 단계 오류: {str(e)[:120]}")
     return fallback_brief(selected, n)
 
 
@@ -557,6 +641,7 @@ $weather_html
 $notes_html
 $sections_html
 <div class="card cheer">💛 $cheer</div>
+<p class="src" style="text-align:center">$stats_html</p>
 </main></body></html>""")
 
 
@@ -621,7 +706,8 @@ def email_html(brief, w, n):
               f'<span style="color:#667085">👕 {html.escape(w["tip"])}</span></div>')
     return (f'<div style="max-width:600px;margin:auto;font-family:-apple-system,\'Malgun Gothic\',sans-serif;color:#1d2733">'
             f'<h2>☀️ {date_label(n)} 아침 브리핑</h2><p>{html.escape(brief["greeting"])}</p>{btn}{wx}{notes_email(brief)}{sec}'
-            f'<p style="text-align:center;margin-top:24px">💛 {html.escape(brief["cheer"])}</p></div>')
+            f'<p style="text-align:center;margin-top:24px">💛 {html.escape(brief["cheer"])}</p>'
+            f'<p style="text-align:center;color:#98a2b3;font-size:12px">{html.escape(brief.get("stats", ""))}</p></div>')
 
 
 # ───────── 실행 ─────────
@@ -638,7 +724,8 @@ def build():
     make_audio(script, SITE / "briefing.mp3")
     page = PAGE_TEMPLATE.substitute(
         date=date_label(n), greeting=html.escape(brief["greeting"]), weather_html=weather_html(weather), notes_html=notes_html(brief),
-        sections_html=sections_html(brief), cheer=html.escape(brief["cheer"]))
+        sections_html=sections_html(brief), cheer=html.escape(brief["cheer"]),
+        stats_html=html.escape(brief.get("stats", "")))
     (SITE / "index.html").write_text(page, encoding="utf-8")
 
     temp = f" {weather['emoji']} {weather['tmax']}°C" if weather else ""
